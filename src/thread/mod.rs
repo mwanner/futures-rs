@@ -9,9 +9,10 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 
 use {Async, Poll, Stream};
-use executor::{spawn, Spawn, NotifyHandle, Notify, enter};
+use executor::{self, spawn, Spawn, NotifyHandle, Notify};
 use future::{Future, Executor, ExecuteError};
 use stream::FuturesUnordered;
 
@@ -24,7 +25,7 @@ pub use self::stream::BlockingStream;
 pub fn block_until<F: Future>(f: F) -> Result<F::Item, F::Error> {
     let mut future = spawn(f);
     let unpark = Arc::new(ThreadUnpark::new(thread::current()));
-    let _e = enter();
+    let _e = executor::enter();
     loop {
         match future.poll_future_notify(&unpark, 0)? {
             Async::NotReady => unpark.park(),
@@ -40,6 +41,28 @@ pub fn block_on_all<F>(f: F)
     f(&tasks.spawner());
     tasks.block_on_all();
 }
+
+pub struct RunningThread {
+    guard: executor::Enter,
+    thread: Arc<ThreadUnpark>
+}
+
+impl RunningThread {
+    pub fn new() -> RunningThread {
+        let thread = Arc::new(ThreadUnpark::new(thread::current()));
+        let guard = executor::enter();
+        RunningThread { thread: thread, guard: guard }
+    }
+
+    pub fn park_thread(&self) {
+        self.thread.park()
+    }
+
+    pub fn park_thread_timeout(&self, dur: Duration) {
+        self.thread.park_timeout(dur);
+    }
+}
+
 
 // An object for cooperatively executing multiple tasks on a single thread.
 // Useful for working with non-`Send` futures.
@@ -71,28 +94,31 @@ impl TaskRunner {
     }
 
     pub fn block_on_all(&mut self) {
-        let unpark = Arc::new(ThreadUnpark::new(thread::current()));
-        let _e = enter();
+        let guard = RunningThread::new();
         loop {
-            self.poll_all(&|me| me.futures.poll_stream_notify(&unpark, 0));
+            self.iterate(&guard);
             if self.non_daemons == 0 {
                 break
             }
-            unpark.park();
+            guard.thread.park();
         }
     }
 
     pub fn block_until<F: Future>(&mut self, f: F) -> Result<F::Item, F::Error> {
-        let unpark = Arc::new(ThreadUnpark::new(thread::current()));
-        let _e = enter();
+        let guard = RunningThread::new();
         let mut future = spawn(f);
         loop {
-            if let Async::Ready(e) = future.poll_future_notify(&unpark, 0)? {
+            let abort_condition = future.poll_future_notify(&guard.thread, 0)?;
+            if let Async::Ready(e) = abort_condition {
                 return Ok(e)
             }
-            self.poll_all(&|me| me.futures.poll_stream_notify(&unpark, 0));
-            unpark.park();
+            self.iterate(&guard);
+            guard.thread.park();
         }
+    }
+
+    pub fn iterate(&mut self, guard: &RunningThread) {
+        self.poll_all(&|me| me.futures.poll_stream_notify(&guard.thread, 0));
     }
 
     fn poll_all(&mut self, f: &Fn(&mut TaskRunner) -> Poll<Option<bool>, bool>) {
@@ -228,6 +254,12 @@ impl ThreadUnpark {
             thread::park();
         }
     }
+
+    fn park_timeout(&self, dur: Duration) {
+        if !self.ready.swap(false, Ordering::SeqCst) {
+            thread::park_timeout(dur);
+        }
+    }
 }
 
 impl Notify for ThreadUnpark {
@@ -236,4 +268,3 @@ impl Notify for ThreadUnpark {
         self.thread.unpark()
     }
 }
-
