@@ -1,4 +1,3 @@
-
 #![allow(warnings, missing_docs)]
 
 use std::prelude::v1::*;
@@ -24,11 +23,10 @@ pub use self::stream::BlockingStream;
 
 pub fn block_until<F: Future>(f: F) -> Result<F::Item, F::Error> {
     let mut future = spawn(f);
-    let unpark = Arc::new(ThreadUnpark::new(thread::current()));
-    let _e = executor::enter();
+    let guard = RunningThread::new();
     loop {
-        match future.poll_future_notify(&unpark, 0)? {
-            Async::NotReady => unpark.park(),
+        match future.poll_future_notify(&guard.thread, 0)? {
+            Async::NotReady => guard.thread.park(),
             Async::Ready(e) => return Ok(e),
         }
     }
@@ -37,13 +35,14 @@ pub fn block_until<F: Future>(f: F) -> Result<F::Item, F::Error> {
 pub fn block_on_all<F>(f: F)
     where F: FnOnce(&Spawner)
 {
-    let mut tasks = TaskRunner::new();
-    f(&tasks.spawner());
-    tasks.block_on_all();
+    let mut el = EventLoop::new();
+    f(&el.spawner());
+    el.block_on_all();
 }
 
+/// Convenience struct combining an executor::Guard with the curretn thread..
 pub struct RunningThread {
-    guard: executor::Enter,
+    guard: executor::Guard,
     thread: Arc<ThreadUnpark>
 }
 
@@ -63,12 +62,17 @@ impl RunningThread {
     }
 }
 
+impl fmt::Debug for RunningThread {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(fmt, "RunningThread")
+    }
+}
 
 // An object for cooperatively executing multiple tasks on a single thread.
 // Useful for working with non-`Send` futures.
 //
 // NB: this is not `Send`
-pub struct TaskRunner {
+pub struct EventLoop {
     inner: Rc<Inner>,
     non_daemons: usize,
     futures: Spawn<FuturesUnordered<SpawnedFuture>>,
@@ -78,9 +82,9 @@ struct Inner {
     new_futures: RefCell<Vec<(Box<Future<Item=(), Error=()>>, bool)>>,
 }
 
-impl TaskRunner {
-    pub fn new() -> TaskRunner {
-        TaskRunner {
+impl EventLoop {
+    pub fn new() -> EventLoop {
+        EventLoop {
             non_daemons: 0,
             futures: spawn(FuturesUnordered::new()),
             inner: Rc::new(Inner {
@@ -121,7 +125,7 @@ impl TaskRunner {
         self.poll_all(&|me| me.futures.poll_stream_notify(&guard.thread, 0));
     }
 
-    fn poll_all(&mut self, f: &Fn(&mut TaskRunner) -> Poll<Option<bool>, bool>) {
+    fn poll_all(&mut self, f: &Fn(&mut EventLoop) -> Poll<Option<bool>, bool>) {
         loop {
             // Make progress on all spawned futures as long as we can
             loop {
@@ -158,7 +162,7 @@ impl TaskRunner {
     }
 }
 
-impl Future for TaskRunner {
+impl Future for EventLoop {
     type Item = ();
     type Error = ();
 
@@ -168,9 +172,9 @@ impl Future for TaskRunner {
     }
 }
 
-impl fmt::Debug for TaskRunner {
+impl fmt::Debug for EventLoop {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("TaskRunner").finish()
+        f.debug_struct("EventLoop").finish()
     }
 }
 

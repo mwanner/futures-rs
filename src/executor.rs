@@ -16,7 +16,6 @@ pub use task_impl::{UnsafeNotify, NotifyHandle};
 pub use self::std_support::*;
 
 #[cfg(feature = "use_std")]
-#[allow(missing_docs)]
 mod std_support {
     use std::cell::Cell;
 
@@ -25,12 +24,17 @@ mod std_support {
 
     thread_local!(static ENTERED: Cell<bool> = Cell::new(false));
 
+    /// A guard that prevents the current thread from entering multiple Executors.
+    ///
+    /// Created by the `enter` function.
     #[derive(Debug)]
-    pub struct Enter {
+    pub struct Guard {
         _priv: (),
     }
 
-    pub fn enter() -> Enter {
+    /// Instantiates a guard that prevents the current thread from
+    /// entering any other executor.
+    pub fn enter() -> Guard {
         ENTERED.with(|c| {
             if c.get() {
                 panic!("cannot reenter an executor context");
@@ -38,10 +42,10 @@ mod std_support {
             c.set(true);
         });
 
-        Enter { _priv: () }
+        Guard { _priv: () }
     }
 
-    impl Drop for Enter {
+    impl Drop for Guard {
         fn drop(&mut self) {
             ENTERED.with(|c| c.set(false));
         }
